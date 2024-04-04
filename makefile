@@ -1,16 +1,12 @@
-# Makefile
-
 CC=gcc
 CFLAGS=-Wall
-LIBS=-lnetfilter_queue
-TARGET=nfqnl_test
-SOURCE=nfqnl_test.c
+LDFLAGS=-lnetfilter_queue
 
-all: $(TARGET)
+all: netfilter-test
 
-$(TARGET): $(SOURCE)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(LIBS)
+netfilter-test: netfilter-test.c
+	$(CC) $(CFLAGS) -o netfilter-test netfilter-test.c $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f netfilter-test
 

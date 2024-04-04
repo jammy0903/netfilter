@@ -1,26 +1,48 @@
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <linux/types.h>
-#include <linux/netfilter.h>		/* for NF_ACCEPT */
+#include <linux/netfilter.h>        /* for NF_ACCEPT */
 #include <errno.h>
-#include <libnet.h>
-#include <libnet/libnet-headers.h>
-#include <libnet/libnet-functions.h>
-
-
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
+#define HOST_PATTERN_LEN 6 
 
-struct nfq_data *tb;
+unsigned char host_pattern[HOST_PATTERN_LEN] = {0x48, 0x6f, 0x73, 0x74, 0x3a, 0x20};
 
+void dump(unsigned char* buf, int size) {
+    int i;
+    for (i = 0; i < size; i++) {
+        if (i != 0 && i % 16 == 0)
+            printf("\n");
+        printf("%02X ", buf[i]);
+    }
+    printf("\n");
+}
 
+static void print_host_address(const unsigned char *payload, int payload_len) {
+    unsigned char host_addr[256] = {0}; 
+    int host_addr_len = 0; // 호스트 주소의 길이
+    for (int i = 0; i <= payload_len - HOST_PATTERN_LEN; i++) {
+        if (memcmp(payload + i, host_pattern, HOST_PATTERN_LEN) == 0) {
+            i += HOST_PATTERN_LEN;
+            while (payload[i] != '\r' && (i < payload_len) && host_addr_len < sizeof(host_addr) - 1) {
+                host_addr[host_addr_len++] = payload[i++];
+            }
+            if (host_addr_len > 0) {
+                printf("Host Address: ");
+                dump(host_addr, host_addr_len);
+            }
+            break;
+        }
+    }
+}
 
 /* returns packet id */
-static u_int32_t print_pkt (nfq_data *tb)
-{
-	int id = 0;
+static u_int32_t print_pkt(struct nfq_data *tb) {
+  	int id = 0;
 	struct nfqnl_msg_packet_hdr *ph;
 	struct nfqnl_msg_packet_hw *hwph;
 	u_int32_t mark,ifi;
@@ -64,111 +86,83 @@ static u_int32_t print_pkt (nfq_data *tb)
 		printf("physoutdev=%u ", ifi);
 
 	ret = nfq_get_payload(tb, &data);
-    if (ret >= 0 & data[9] == IPPROTO_TCP){
-        printf("payload_len=%d\n", ret);
-        printf("오직 0X0%d 패킷만 취급한다 \n",data[9]);
+	if (ret >= 0)
+		printf("payload_len=%d\n", ret);
 
+    if (ret >= 0 && data[9] == IPPROTO_TCP) {
+        int ip_hdr_len = (data[0] & 0x0F) * 4;
+        unsigned char *tcp_header = data + ip_hdr_len;
+        int tcp_hdr_len = ((tcp_header[12] >> 4) & 0x0F) * 4;
+        unsigned char *payload = tcp_header + tcp_hdr_len;
+        int payload_len = ret - ip_hdr_len - tcp_hdr_len;
+
+        print_host_address(payload, payload_len);
+    }
+    fputc('\n', stdout);
+
+    return id;
+}
+
+static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *nfa, void *data) {
+    u_int32_t id = print_pkt(nfa);
+    printf("entering callback\n");
+    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+}
+
+int main() {
+    struct nfq_handle *h;
+    struct nfq_q_handle *qh;
+    int fd;
+    char buf[4096] __attribute__ ((aligned));
+
+    printf("opening library handle\n");
+    h = nfq_open();
+    if (!h) {
+        fprintf(stderr, "error during nfq_open()\n");
+        exit(1);
     }
 
+    if (nfq_unbind_pf(h, AF_INET) < 0) {
+        fprintf(stderr, "error during nfq_unbind_pf()\n");
+        exit(1);
+    }
 
-    int ip_header_len = (data[0] & 0x0F) * 4;
-    unsigned char *tcp_header = data + ip_header_len;
+    if (nfq_bind_pf(h, AF_INET) < 0) {
+        fprintf(stderr, "error during nfq_bind_pf()\n");
+        exit(1);
+    }
 
+    qh = nfq_create_queue(h, 0, &cb, NULL);
+    if (!qh) {
+        fprintf(stderr, "error during nfq_create_queue()\n");
+        exit(1);
+    }
 
+    if (nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff) < 0) {
+        fprintf(stderr, "can't set packet_copy mode\n");
+        exit(1);
+    }
 
+    fd = nfq_fd(h);
 
-	fputc('\n', stdout);
+    while (1) {
+        int rv = recv(fd, buf, sizeof(buf), 0);
+        if (rv >= 0) {
+            nfq_handle_packet(h, buf, rv);
+            continue;
+        }
 
-	return id;
-}
+        if (rv < 0 && errno == ENOBUFS) {
+            printf("losing packets!\n");
+            continue;
+        }
+        perror("recv failed");
+        break;
+    }
 
+    nfq_destroy_queue(qh);
+    nfq_close(h);
 
-
-
-static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
-	      struct nfq_data *nfa, void *data)
-{
-	u_int32_t id = print_pkt(nfa);
-	printf("entering callback\n");
-	return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-}
-
-int main(int argc, char **argv)
-{
-	struct nfq_handle *h;
-	struct nfq_q_handle *qh;
-	struct nfnl_handle *nh;
-	int fd;
-	int rv;
-	char buf[4096] __attribute__ ((aligned));
-
-	printf("opening library handle\n");
-	h = nfq_open();
-	if (!h) {
-		fprintf(stderr, "error during nfq_open()\n");
-		exit(1);
-	}
-
-	printf("unbinding existing nf_queue handler for AF_INET (if any)\n");
-	if (nfq_unbind_pf(h, AF_INET) < 0) {
-		fprintf(stderr, "error during nfq_unbind_pf()\n");
-		exit(1);
-	}
-
-	printf("binding nfnetlink_queue as nf_queue handler for AF_INET\n");
-	if (nfq_bind_pf(h, AF_INET) < 0) {
-		fprintf(stderr, "error during nfq_bind_pf()\n");
-		exit(1);
-	}
-
-	printf("binding this socket to queue '0'\n");
-	qh = nfq_create_queue(h,  0, &cb, NULL);
-	if (!qh) {
-		fprintf(stderr, "error during nfq_create_queue()\n");
-		exit(1);
-	}
-
-	printf("setting copy_packet mode\n");
-	if (nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff) < 0) {
-		fprintf(stderr, "can't set packet_copy mode\n");
-		exit(1);
-	}
-
-	fd = nfq_fd(h);
-
-    unsigned char *data;
-    int ret = nfq_get_payload(tb, &data);
-	for (;;) {
-        if ((rv = recv(fd, buf, sizeof(buf), 0)) >= 0 ) {
-			printf("pkt received\n");
-			nfq_handle_packet(h, buf, rv);
-			
-	
-			continue;
-		}
-
-
-		if (rv < 0 && errno == ENOBUFS) {
-			printf("losing packets!\n");
-			continue;
-		}
-		perror("recv failed");
-		break;
-	}
-
-	printf("unbinding from queue 0\n");
-	nfq_destroy_queue(qh);
-
-#ifdef INSANE
-	/* normally, applications SHOULD NOT issue this command, since
-	 * it detaches other programs/sockets from AF_INET, too ! */
-	printf("unbinding from AF_INET\n");
-	nfq_unbind_pf(h, AF_INET);
-#endif
-
-	printf("closing library handle\n");
-	nfq_close(h);
-
-	exit(0);
+    return 0;
 }
 
